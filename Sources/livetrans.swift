@@ -18,7 +18,11 @@ let usage = """
   -o, --out <文件>              输出 Markdown 路径（默认 ./transcripts/<时间>.md）
   --vocab <名字或文件>           术语表，比如 --vocab polymer（在 livetrans/vocab/ 里找 polymer.txt）
   --topic <文字>                课程主题，告诉 AI 这是什么课（默认取术语表里的 "# topic:" 那一行）
-  --model <id>                 AI 翻译用的 Claude 模型（默认 claude-sonnet-5）
+  --provider <名字>              AI 翻译服务：claude、deepseek、openai（任意兼容 OpenAI 的接口）
+                               默认 auto：有 ANTHROPIC_API_KEY 用 Claude，否则有 DEEPSEEK_API_KEY 用 DeepSeek
+  --model <名字>                 模型（默认 Claude 用 claude-sonnet-5，DeepSeek 用 deepseek-flash）
+  --api-base <地址>              接口地址（openai 必填，比如 http://localhost:11434/v1）
+  --api-key-env <变量名>          key 所在的环境变量（openai 默认不需要 key）
   --no-ai                      不用 AI，只用本地翻译
   --no-preview                 不边听边翻（省 API 费用），只翻译定稿的句子
   --from <locale>              说话语言（默认 en-US）
@@ -42,7 +46,10 @@ struct Options {
     var to = "zh-Hans"
     var vocabPath: String?
     var topic = ""
-    var model = "claude-sonnet-5"
+    var model: String?
+    var provider = "auto"
+    var apiBase: String?
+    var apiKeyVariable: String?
     var ai = true
     var preview = true
     var fast = false
@@ -73,6 +80,9 @@ func parseOptions() throws -> Options {
         case "--vocab": o.vocabPath = try value(for: arg)
         case "--topic": o.topic = try value(for: arg)
         case "--model": o.model = try value(for: arg)
+        case "--provider": o.provider = try value(for: arg)
+        case "--api-base": o.apiBase = try value(for: arg)
+        case "--api-key-env": o.apiKeyVariable = try value(for: arg)
         case "--no-ai": o.ai = false
         case "--no-preview": o.preview = false
         case "--fast": o.fast = true
@@ -445,7 +455,7 @@ func describe(_ status: LanguageAvailability.Status) -> String {
     }
 }
 
-// MARK: - Claude translation
+// MARK: - AI translation
 
 struct Line {
     let start: Double
@@ -453,7 +463,7 @@ struct Line {
     let zh: String?
 }
 
-enum ClaudeError: Error, CustomStringConvertible {
+enum APIError: Error, CustomStringConvertible {
     case unauthorized
     case refused
     case http(Int, String)
@@ -468,35 +478,55 @@ enum ClaudeError: Error, CustomStringConvertible {
         }
     }
 
+    /// Worth one more try: rate limits, server hiccups, or an empty/garbled reply.
     var isRetryable: Bool {
-        if case .http(let status, _) = self { return status == 429 || status >= 500 }
-        return false
+        switch self {
+        case .http(let status, _): return status == 429 || status >= 500
+        case .badResponse: return true
+        default: return false
+        }
+    }
+
+    /// Reads an error response; a non-API body (a proxy or gateway page) shows its start.
+    init(status: Int, body: Data) {
+        if status == 401 || status == 403 {
+            self = .unauthorized
+            return
+        }
+        let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+        let message = (json?["error"] as? [String: Any])?["message"] as? String
+            ?? String(decoding: body.prefix(160), as: UTF8.self)
+                .replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        debug("HTTP \(status): \(String(decoding: body.prefix(2000), as: UTF8.self))")
+        self = .http(status, message)
     }
 }
 
-/// Talks to Claude. `translate` handles finished segments (cleaned-up English plus a
-/// translation, with the course glossary and recent lines as context); `preview`
-/// streams a quick translation of whatever is still being said.
-final class ClaudeTranslator {
-    let model: String
-    private let apiKey: String
-    private let system: String
-    private let previewSystem: String
+/// An AI service used for translation. `translate` handles finished segments (cleaned-up
+/// English plus a translation); `preview` streams a quick translation of unfinished speech,
+/// calling `onUpdate` with the text so far and once more, complete, when it ends.
+protocol AITranslator: AnyObject {
+    var label: String { get }
+    var disabled: Bool { get }  // set once the API key is rejected
+    func translate(_ batch: [Segment]) async throws -> [Line]
+    func preview(_ text: String, onUpdate: (String, Bool) async -> Void) async throws
+}
+
+/// What every AI backend is told, plus the reply shape and the rolling context.
+final class TranslationBrief {
+    let system: String
+    let previewSystem: String
     private var history: [(en: String, zh: String)] = []
-    private(set) var disabled = false  // set once the API key is rejected
 
-    private struct Item: Decodable {
-        let en: String
-        let zh: String
-    }
-
-    private struct Reply: Decodable {
+    struct Reply: Decodable {
+        struct Item: Decodable {
+            let en: String
+            let zh: String
+        }
         let items: [Item]
     }
 
-    init(apiKey: String, model: String, topic: String, targetLanguage: String, glossary: [String]) {
-        self.apiKey = apiKey
-        self.model = model
+    init(topic: String, targetLanguage: String, glossary: [String]) {
         var system = """
             You turn live classroom speech into \(targetLanguage) subtitles. Lecture topic: \(topic).
 
@@ -505,6 +535,7 @@ final class ClaudeTranslator {
             - "zh": a natural \(targetLanguage) translation of "en", using the standard terminology of textbooks in this field. Keep formulas, symbols and abbreviations as written (e.g. Tg, Mn, PDI). Inside "zh", quote with “ ” or 「」, never with ASCII double quotes.
 
             Return exactly one item per segment, in order, and translate each segment in full. A segment may start or end mid-sentence; translate it as it is without merging it with its neighbors.
+            Reply with JSON only, in this form: {"items": [{"en": "...", "zh": "..."}]}
             """
         if !glossary.isEmpty {
             system += "\n\nCourse glossary (\"English = preferred translation\"; lines without \"=\" are terms that may come up):\n"
@@ -516,7 +547,8 @@ final class ClaudeTranslator {
             """
     }
 
-    func translate(_ batch: [Segment]) async throws -> [Line] {
+    /// The request for a batch: recent translated lines for context, then the new segments.
+    func request(for batch: [Segment]) -> String {
         var prompt = ""
         if !history.isEmpty {
             prompt += "Earlier in the lecture (context only, already translated):\n"
@@ -525,8 +557,16 @@ final class ClaudeTranslator {
         }
         prompt += "New segments:\n"
         for (i, segment) in batch.enumerated() { prompt += "\(i + 1). \(segment.text)\n" }
+        return prompt
+    }
 
-        let items = try await send(prompt)
+    /// Parses a reply into lines (merged if the count doesn't match) and remembers them.
+    func lines(for batch: [Segment], reply text: String) throws -> [Line] {
+        // Some models wrap the JSON in a code fence or a sentence; take the outermost object.
+        guard let open = text.firstIndex(of: "{"), let close = text.lastIndex(of: "}"), open < close,
+              let items = try? JSONDecoder().decode(Reply.self, from: Data(text[open...close].utf8)).items,
+              !items.isEmpty
+        else { throw APIError.badResponse }
         let lines: [Line]
         if items.count == batch.count {
             lines = zip(batch, items).map { Line(start: $0.start, en: $1.en, zh: $1.zh) }
@@ -538,11 +578,41 @@ final class ClaudeTranslator {
         history = Array(history.suffix(6))
         return lines
     }
+}
 
-    /// Streams a translation of unfinished speech, calling `onUpdate` with the text so far
-    /// (and once more with `complete` set when the stream ends).
+/// Tries once more after a retryable failure.
+func withRetry<T>(_ body: () async throws -> T) async throws -> T {
+    do {
+        return try await body()
+    } catch let error as APIError where error.isRetryable {
+        try? await Task.sleep(for: .seconds(1))
+    } catch is URLError {
+        try? await Task.sleep(for: .seconds(1))
+    }
+    return try await body()
+}
+
+/// Claude via the Anthropic Messages API (raw HTTP; there is no official Swift SDK).
+final class ClaudeTranslator: AITranslator {
+    let model: String
+    var label: String { "Claude（\(model)）" }
+    private(set) var disabled = false
+    private let apiKey: String
+    private let brief: TranslationBrief
+
+    init(apiKey: String, model: String, brief: TranslationBrief) {
+        self.apiKey = apiKey
+        self.model = model
+        self.brief = brief
+    }
+
+    func translate(_ batch: [Segment]) async throws -> [Line] {
+        let prompt = brief.request(for: batch)
+        return try await withRetry { try brief.lines(for: batch, reply: try await complete(prompt)) }
+    }
+
     func preview(_ text: String, onUpdate: (String, Bool) async -> Void) async throws {
-        let request = try makeRequest(system: previewSystem, cacheSystem: false, prompt: text,
+        let request = try makeRequest(system: brief.previewSystem, cacheSystem: false, prompt: text,
                                       maxTokens: 1024, format: nil, stream: true)
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -556,7 +626,7 @@ final class ClaudeTranslator {
             guard let event = (try? JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8))) as? [String: Any]
             else { continue }
             if event["type"] as? String == "error" {
-                throw ClaudeError.http(0, (event["error"] as? [String: Any])?["message"] as? String ?? "")
+                throw APIError.http(0, (event["error"] as? [String: Any])?["message"] as? String ?? "")
             }
             guard event["type"] as? String == "content_block_delta",
                   let delta = event["delta"] as? [String: Any], delta["type"] as? String == "text_delta",
@@ -568,20 +638,8 @@ final class ClaudeTranslator {
         await onUpdate(translation, true)
     }
 
-    private func send(_ prompt: String) async throws -> [Item] {
-        for attempt in 1...2 {
-            do {
-                return try await sendOnce(prompt)
-            } catch let error as ClaudeError where error.isRetryable && attempt == 1 {
-                try? await Task.sleep(for: .seconds(1))
-            } catch is URLError where attempt == 1 {
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-        return try await sendOnce(prompt)
-    }
-
-    private func sendOnce(_ prompt: String) async throws -> [Item] {
+    /// One structured-output request; returns the reply's JSON text.
+    private func complete(_ prompt: String) async throws -> String {
         let item: [String: Any] = [
             "type": "object",
             "properties": ["en": ["type": "string"], "zh": ["type": "string"]],
@@ -594,18 +652,17 @@ final class ClaudeTranslator {
             "required": ["items"],
             "additionalProperties": false,
         ]
-        let request = try makeRequest(system: system, cacheSystem: true, prompt: prompt, maxTokens: 16000,
+        let request = try makeRequest(system: brief.system, cacheSystem: true, prompt: prompt, maxTokens: 16000,
                                       format: ["type": "json_schema", "schema": schema], stream: false)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw failure(status: status, body: data) }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        if json["stop_reason"] as? String == "refusal" { throw ClaudeError.refused }
+        if json["stop_reason"] as? String == "refusal" { throw APIError.refused }
         guard let blocks = json["content"] as? [[String: Any]],
-              let text = blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String,
-              let reply = try? JSONDecoder().decode(Reply.self, from: Data(text.utf8))
-        else { throw ClaudeError.badResponse }
-        return reply.items
+              let text = blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String
+        else { throw APIError.badResponse }
+        return text
     }
 
     private func makeRequest(system: String, cacheSystem: Bool, prompt: String, maxTokens: Int,
@@ -640,41 +697,124 @@ final class ClaudeTranslator {
         return request
     }
 
-    private func failure(status: Int, body: Data) -> ClaudeError {
-        if status == 401 || status == 403 {
-            disabled = true
-            return .unauthorized
-        }
-        let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
-        let message = (json?["error"] as? [String: Any])?["message"] as? String
-            // Not an API error body (e.g. a proxy or gateway page): show its start instead.
-            ?? String(decoding: body.prefix(160), as: UTF8.self)
-                .replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-        debug("HTTP \(status): \(String(decoding: body.prefix(2000), as: UTF8.self))")
-        return .http(status, message)
+    private func failure(status: Int, body: Data) -> APIError {
+        let error = APIError(status: status, body: body)
+        if case .unauthorized = error { disabled = true }
+        return error
     }
 }
 
-/// Final translation of finished segments: Claude when configured (falling back to
-/// on-device translation when a request fails), otherwise on-device only.
+/// Any OpenAI-style chat-completions API: DeepSeek, Qwen, Kimi, a local Ollama server …
+final class OpenAICompatibleTranslator: AITranslator {
+    let label: String
+    private(set) var disabled = false
+    private let endpoint: URL
+    private let apiKey: String  // empty for local servers
+    private let model: String
+    private let extraBody: [String: Any]
+    private let brief: TranslationBrief
+    private var jsonMode = true  // off once a server rejects `response_format`
+
+    init(name: String, baseURL: URL, apiKey: String, model: String, extraBody: [String: Any] = [:],
+         brief: TranslationBrief) {
+        label = "\(name)（\(model)）"
+        endpoint = baseURL.appendingPathComponent("chat/completions")
+        self.apiKey = apiKey
+        self.model = model
+        self.extraBody = extraBody
+        self.brief = brief
+    }
+
+    func translate(_ batch: [Segment]) async throws -> [Line] {
+        let prompt = brief.request(for: batch)
+        return try await withRetry { try brief.lines(for: batch, reply: try await complete(prompt)) }
+    }
+
+    func preview(_ text: String, onUpdate: (String, Bool) async -> Void) async throws {
+        let request = try makeRequest(system: brief.previewSystem, prompt: text, json: false, stream: true)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            var body = Data()
+            for try await byte in bytes { body.append(byte) }
+            throw failure(status: status, body: body)
+        }
+        var translation = ""
+        for try await line in bytes.lines where line.hasPrefix("data:") {
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let event = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any],
+                  let delta = (event["choices"] as? [[String: Any]])?.first?["delta"] as? [String: Any],
+                  let piece = delta["content"] as? String, !piece.isEmpty
+            else { continue }
+            translation += piece
+            await onUpdate(translation, false)
+        }
+        await onUpdate(translation, true)
+    }
+
+    /// One JSON-mode request; returns the reply's JSON text.
+    private func complete(_ prompt: String) async throws -> String {
+        let request = try makeRequest(system: brief.system, prompt: prompt, json: jsonMode, stream: false)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 400, jsonMode, String(decoding: data, as: UTF8.self).contains("response_format") {
+            // JSON mode isn't universal; the system prompt already asks for JSON, so go without.
+            jsonMode = false
+            return try await complete(prompt)
+        }
+        guard status == 200 else { throw failure(status: status, body: data) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let message = (json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any],
+              let text = message["content"] as? String, !text.isEmpty
+        else { throw APIError.badResponse }
+        return text
+    }
+
+    private func makeRequest(system: String, prompt: String, json: Bool, stream: Bool) throws -> URLRequest {
+        var body = extraBody
+        body["model"] = model
+        body["messages"] = [["role": "system", "content": system], ["role": "user", "content": prompt]]
+        body["max_tokens"] = json ? 4096 : 1024  // only widely supported parameters: servers differ on the rest
+        if json { body["response_format"] = ["type": "json_object"] }
+        if stream { body["stream"] = true }
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    private func failure(status: Int, body: Data) -> APIError {
+        let error = APIError(status: status, body: body)
+        if case .unauthorized = error { disabled = true }
+        return error
+    }
+}
+
+/// Final translation of finished segments: the AI backend when configured (falling back
+/// to on-device translation when a request fails), otherwise on-device only.
 final class FinalTranslator {
-    private let claude: ClaudeTranslator?
+    private let ai: AITranslator?
     private let local: Translator?
     private let console: Console
     private var lastWarning = ""
 
-    init(claude: ClaudeTranslator?, local: Translator?, console: Console) {
-        self.claude = claude
+    init(ai: AITranslator?, local: Translator?, console: Console) {
+        self.ai = ai
         self.local = local
         self.console = console
     }
 
     func finalize(_ batch: [Segment]) async -> [Line] {
-        if let claude, !claude.disabled {
+        if let ai, !ai.disabled {
             do {
-                return try await claude.translate(batch)
+                return try await ai.translate(batch)
             } catch {
-                let warning = "⚠️ AI 翻译失败（\(reason(error))），这几句改用本地翻译" + (claude.disabled ? "，本次不再调用 AI。" : "。")
+                let warning = "⚠️ AI 翻译失败（\(reason(error))），这几句改用本地翻译" + (ai.disabled ? "，本次不再调用 AI。" : "。")
                 if warning != lastWarning {
                     lastWarning = warning
                     await console.emit(warning)
@@ -691,20 +831,83 @@ final class FinalTranslator {
 }
 
 struct Translation {
-    let preview: ClaudeTranslator?
+    let preview: AITranslator?
     let final: FinalTranslator
 }
 
 func reason(_ error: Error) -> String {
-    (error as? ClaudeError)?.description ?? error.localizedDescription
+    (error as? APIError)?.description ?? error.localizedDescription
+}
+
+/// Where an AI backend lives and which key it needs.
+struct Provider {
+    let name: String
+    let model: String
+    let keyVariable: String?  // nil: no key needed (local server)
+    let keyPrefix: String?
+    let make: (_ key: String, _ brief: TranslationBrief) -> AITranslator
+
+    /// `--provider auto` picks Claude, then DeepSeek, whichever has a key set.
+    static func resolve(_ o: Options) throws -> Provider? {
+        let env = ProcessInfo.processInfo.environment
+        switch o.provider {
+        case "auto":
+            if !(env["ANTHROPIC_API_KEY"] ?? "").isEmpty { return claude(o) }
+            if !(env["DEEPSEEK_API_KEY"] ?? "").isEmpty { return deepseek(o) }
+            return claude(o)  // not configured; reported as missing key
+        case "claude": return claude(o)
+        case "deepseek": return deepseek(o)
+        case "openai":
+            guard let base = o.apiBase.flatMap(URL.init(string:)) else {
+                throw CLIError("--provider openai 需要 --api-base <地址>，比如 http://localhost:11434/v1")
+            }
+            guard let model = o.model else { throw CLIError("--provider openai 需要 --model <模型名>") }
+            return Provider(name: base.host ?? "OpenAI 兼容接口", model: model, keyVariable: o.apiKeyVariable,
+                            keyPrefix: nil) { key, brief in
+                OpenAICompatibleTranslator(name: base.host ?? "API", baseURL: base, apiKey: key, model: model, brief: brief)
+            }
+        default:
+            throw CLIError("不认识的 --provider \(o.provider)（可选：claude、deepseek、openai）")
+        }
+    }
+
+    static func claude(_ o: Options) -> Provider {
+        let model = o.model ?? "claude-sonnet-5"
+        return Provider(name: "Claude", model: model, keyVariable: "ANTHROPIC_API_KEY", keyPrefix: "sk-ant-") { key, brief in
+            ClaudeTranslator(apiKey: key, model: model, brief: brief)
+        }
+    }
+
+    static func deepseek(_ o: Options) -> Provider {
+        let model = o.model ?? "deepseek-flash"
+        return Provider(name: "DeepSeek", model: model, keyVariable: o.apiKeyVariable ?? "DEEPSEEK_API_KEY",
+                        keyPrefix: "sk-") { key, brief in
+            OpenAICompatibleTranslator(
+                name: "DeepSeek", baseURL: URL(string: o.apiBase ?? "https://api.deepseek.com")!, apiKey: key,
+                model: model,
+                extraBody: ["thinking": ["type": "disabled"]],  // on by default; far too slow for live subtitles
+                brief: brief)
+        }
+    }
+
+    /// The key from the environment, or why it can't be used.
+    func key() -> (key: String, problem: String?) {
+        guard let keyVariable else { return ("", nil) }
+        let key = (ProcessInfo.processInfo.environment[keyVariable] ?? "").trimmingCharacters(in: .whitespaces)
+        if key.isEmpty { return ("", "没有设置 \(keyVariable)") }
+        if let problem = apiKeyProblem(key, prefix: keyPrefix) { return (key, "\(keyVariable) 看起来不对（\(problem)）") }
+        return (key, nil)
+    }
 }
 
 /// Catches a key that was pasted twice, cut short, or picked up stale from an old shell.
-func apiKeyProblem(_ key: String) -> String? {
-    if key.components(separatedBy: "sk-ant-").count > 2 { return "里面有好几个 key，可能粘贴了多次" }
-    if !key.hasPrefix("sk-ant-") { return "不是以 sk-ant- 开头" }
-    if key.count < 80 || key.count > 200 { return "长度 \(key.count)，正常大约 108" }
+func apiKeyProblem(_ key: String, prefix: String?) -> String? {
     if key.contains(where: { $0.isWhitespace || $0 == "\"" }) { return "里面有空格或引号" }
+    if key.count > 300 { return "长度 \(key.count)，太长了，可能粘贴了多次" }
+    guard let prefix else { return nil }
+    if !key.hasPrefix(prefix) { return "不是以 \(prefix) 开头" }
+    if key.components(separatedBy: prefix).count > 2 { return "里面有好几个 key，可能粘贴了多次" }
+    if key.count < 20 { return "长度 \(key.count)，太短了" }
     return nil
 }
 
@@ -714,45 +917,43 @@ func targetLanguageName(_ identifier: String) -> String {
     return Locale(identifier: "en").localizedString(forIdentifier: identifier) ?? identifier
 }
 
-func setUpTranslation(_ o: Options, glossary: [String], console: Console) async -> Translation? {
+func setUpTranslation(_ o: Options, glossary: [String], console: Console) async throws -> Translation? {
     guard o.translate else { return nil }
     let from = Locale(identifier: o.from).language
     let to = Locale.Language(identifier: o.to)
     let localStatus = await LanguageAvailability().status(from: from, to: to)
     let localReady = localStatus == .installed
-    var apiKey = (ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? "").trimmingCharacters(in: .whitespaces)
-    if o.ai, !apiKey.isEmpty, let problem = apiKeyProblem(apiKey) {
-        await console.emit("""
-            ⚠️ ANTHROPIC_API_KEY 看起来不对（\(problem)），这次不用 AI。
-               如果刚改过 ~/.zshrc：关掉这个终端标签页，开一个新的再运行。
 
-            """)
-        apiKey = ""
+    var ai: AITranslator?
+    if o.ai, let provider = try Provider.resolve(o) {
+        let (key, problem) = provider.key()
+        if let problem {
+            await console.emit("⚠️ \(problem)，这次不用 AI 翻译。"
+                + (key.isEmpty ? "" : "\n   如果刚改过 ~/.zshrc：关掉这个终端标签页，开一个新的再运行。"))
+        } else {
+            let brief = TranslationBrief(topic: o.topic, targetLanguage: targetLanguageName(o.to), glossary: glossary)
+            ai = provider.make(key, brief)
+        }
     }
-    let claude = o.ai && !apiKey.isEmpty
-        ? ClaudeTranslator(apiKey: apiKey, model: o.model, topic: o.topic,
-                           targetLanguage: targetLanguageName(o.to), glossary: glossary)
-        : nil
 
-    guard localReady || claude != nil else {
+    guard localReady || ai != nil else {
         await console.emit("""
-            ⚠️ 本地翻译语言包：\(describe(localStatus))，也没有设置 ANTHROPIC_API_KEY。这次先只转写英文。
-               下载方法：系统设置 → 通用 → 语言与地区 → 最下面「翻译语言…」，
-               下载「英语」和「中文（简体）」，然后重新运行。
+            ⚠️ 没有可用的 AI 翻译，本地翻译语言包也\(describe(localStatus))。这次先只转写英文。
+               本地翻译的下载方法：系统设置 → 通用 → 语言与地区 → 最下面「翻译语言…」。
 
             """)
         return nil
     }
-    if let claude {
-        await console.emit("翻译：Claude（\(claude.model)）"
+    if let ai {
+        await console.emit("翻译：\(ai.label)"
             + (o.preview ? "边听边翻，每句定稿后再纠错精翻" : "每句定稿后纠错并翻译（实时翻译已关闭）"))
     } else {
         // The on-device model competes with speech recognition for the chip, so it only
-        // translates finished sentences; live translation needs the API.
-        await console.emit("翻译：本地翻译，每句定稿后出中文" + (o.ai ? "（设置 ANTHROPIC_API_KEY 后可以边听边翻）" : ""))
+        // translates finished sentences; live translation needs an API.
+        await console.emit("翻译：本地翻译（效果一般），每句定稿后出中文")
     }
-    return Translation(preview: o.preview ? claude : nil,
-                       final: FinalTranslator(claude: claude,
+    return Translation(preview: o.preview ? ai : nil,
+                       final: FinalTranslator(ai: ai,
                                               local: localReady ? Translator(from: from, to: to, fast: o.fast) : nil,
                                               console: console))
 }
@@ -1566,13 +1767,16 @@ struct LiveTrans {
         let status = await LanguageAvailability().status(from: Locale(identifier: o.from).language,
                                                           to: Locale.Language(identifier: o.to))
         print("本地翻译语言包（\(o.from) → \(o.to)）：", describe(status))
-        let key = (ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? "").trimmingCharacters(in: .whitespaces)
-        if key.isEmpty {
-            print("AI 翻译： 没有设置 ANTHROPIC_API_KEY（只用本地翻译）")
-        } else if let problem = apiKeyProblem(key) {
-            print("AI 翻译： ANTHROPIC_API_KEY 看起来不对（\(problem)）—— 刚改过 ~/.zshrc 的话，开一个新的终端标签页再试")
-        } else {
-            print("AI 翻译： 已设置 ANTHROPIC_API_KEY ✓（模型 \(o.model)）")
+        do {
+            if let provider = try Provider.resolve(o) {
+                if let problem = provider.key().problem {
+                    print("AI 翻译： \(provider.name) —— \(problem)（没有 AI 时只用本地翻译，效果一般）")
+                } else {
+                    print("AI 翻译： \(provider.name) ✓（模型 \(provider.model)）")
+                }
+            }
+        } catch {
+            print("AI 翻译： \(error)")
         }
         let mic: String
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -1619,7 +1823,7 @@ struct LiveTrans {
             }
             apple = (engine, analyzer)
         }
-        let translation = await setUpTranslation(o, glossary: vocab.glossary, console: console)
+        let translation = try await setUpTranslation(o, glossary: vocab.glossary, console: console)
 
         let stamp = Date().formatted(.verbatim("\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits)_\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased))-\(minute: .twoDigits)",
                                                timeZone: .current, calendar: .current))
