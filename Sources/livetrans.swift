@@ -918,7 +918,15 @@ struct Provider {
     func key() -> (key: String, problem: String?) {
         guard let keyVariable else { return ("", nil) }
         let key = (ProcessInfo.processInfo.environment[keyVariable] ?? "").trimmingCharacters(in: .whitespaces)
-        if key.isEmpty { return ("", "没有设置 \(keyVariable)") }
+        if key.isEmpty {
+            // A common trap: the key is in ~/.zshrc, but this terminal was opened before it was added.
+            let zshrc = (try? String(contentsOfFile: NSHomeDirectory() + "/.zshrc", encoding: .utf8)) ?? ""
+            if zshrc.contains("export \(keyVariable)=") {
+                return ("", "~/.zshrc 里有 \(keyVariable)，但这个终端窗口是加 key 之前打开的，还没读到。"
+                    + "运行 source ~/.zshrc 或开一个新窗口后再试")
+            }
+            return ("", "没有设置 \(keyVariable)")
+        }
         if let problem = apiKeyProblem(key, prefix: keyPrefix) { return (key, "\(keyVariable) 看起来不对（\(problem)）") }
         return (key, nil)
     }
