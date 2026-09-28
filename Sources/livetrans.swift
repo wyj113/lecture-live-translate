@@ -510,6 +510,8 @@ protocol AITranslator: AnyObject {
     var disabled: Bool { get }  // set once the API key is rejected
     func translate(_ batch: [Segment]) async throws -> [Line]
     func preview(_ text: String, onUpdate: (String, Bool) async -> Void) async throws
+    /// A tiny request; returns the model the server says it used.
+    func ping() async throws -> String
 }
 
 /// What every AI backend is told, plus the reply shape and the rolling context.
@@ -638,6 +640,16 @@ final class ClaudeTranslator: AITranslator {
         await onUpdate(translation, true)
     }
 
+    func ping() async throws -> String {
+        let request = try makeRequest(system: "Reply with OK.", cacheSystem: false, prompt: "ping",
+                                      maxTokens: 16, format: nil, stream: false)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw failure(status: status, body: data) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return json?["model"] as? String ?? model
+    }
+
     /// One structured-output request; returns the reply's JSON text.
     private func complete(_ prompt: String) async throws -> String {
         let item: [String: Any] = [
@@ -751,6 +763,18 @@ final class OpenAICompatibleTranslator: AITranslator {
             await onUpdate(translation, false)
         }
         await onUpdate(translation, true)
+    }
+
+    func ping() async throws -> String {
+        var request = try makeRequest(system: "Reply with OK.", prompt: "ping", json: false, stream: false)
+        var body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
+        body["max_tokens"] = 16
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw failure(status: status, body: data) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return json?["model"] as? String ?? model
     }
 
     /// One JSON-mode request; returns the reply's JSON text.
@@ -1769,10 +1793,18 @@ struct LiveTrans {
         print("本地翻译语言包（\(o.from) → \(o.to)）：", describe(status))
         do {
             if let provider = try Provider.resolve(o) {
-                if let problem = provider.key().problem {
+                let (key, problem) = provider.key()
+                if let problem {
                     print("AI 翻译： \(provider.name) —— \(problem)（没有 AI 时只用本地翻译，效果一般）")
                 } else {
-                    print("AI 翻译： \(provider.name) ✓（模型 \(provider.model)）")
+                    print("AI 翻译： \(provider.name)（设定的模型 \(provider.model)）")
+                    let brief = TranslationBrief(topic: "", targetLanguage: "Simplified Chinese", glossary: [])
+                    do {
+                        let served = try await provider.make(key, brief).ping()
+                        print("连接测试： ✓ key 可用，服务器实际使用的模型：\(served)")
+                    } catch {
+                        print("连接测试： ✗ \(reason(error))")
+                    }
                 }
             }
         } catch {

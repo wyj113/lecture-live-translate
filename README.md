@@ -82,7 +82,7 @@ livetrans --vocab thermo --provider openai --api-base http://localhost:11434/v1 
 livetrans --vocab polymer              # 实时：麦克风 → 英文 → 中文，Ctrl-C 结束
 livetrans --vocab thermo               # 换一门课，换一个术语表
 livetrans 录音.m4a --vocab thermo       # 处理录音文件，比如从 Notability 导出的音频
-livetrans --check                      # 检查模型、麦克风、API key
+livetrans --check                      # 检查模型、麦克风、API key，并发一个很小的请求测试连接
 livetrans --help                       # 全部选项
 ```
 
