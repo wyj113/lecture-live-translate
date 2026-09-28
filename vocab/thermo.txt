@@ -125,3 +125,23 @@ chemical reaction equilibrium = 化学反应平衡
 equilibrium constant = 平衡常数
 extent of reaction = 反应进度
 Koretsky
+# —— 以下根据课堂笔记和转录补充 ——
+throttling device = 节流装置
+throttling = 节流
+isenthalpic = 等焓
+steam table = 水蒸气表
+interpolation = 插值
+saturated steam = 饱和蒸汽
+filling a tank = 充气（储罐充装）
+supply line = 供气管线
+Newton's law of cooling = 牛顿冷却定律
+surroundings temperature = 环境温度
+final state = 终态
+initial state = 初态
+assumption = 假设
+done quickly = 快速完成（可视为绝热）
+specific enthalpy = 比焓
+specific internal energy = 比内能
+specific volume = 比体积
+kilojoule = 千焦
+megapascal = 兆帕
