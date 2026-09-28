@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.livetrans</string>
+	<key>CFBundleName</key>
+	<string>livetrans</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>实时转录麦克风里的语音</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>在本机把语音转成文字</string>
+</dict>
+</plist>

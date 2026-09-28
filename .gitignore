@@ -1,0 +1,15 @@
+# build output
+/livetrans
+
+# models are downloaded by setup.sh (hundreds of MB)
+/models/
+
+# local runs and test material
+/transcripts/
+/test/
+*.log
+*.aiff
+*.wav
+
+.DS_Store
+.claude/
