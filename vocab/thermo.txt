@@ -3,6 +3,28 @@
 # 每行一个术语，可以写成 "英文 = 中文"：
 #   英文部分用来帮助语音识别认出这个词；
 #   整行会交给 AI，让它按指定的中文译名翻译。
+# —— 课上听错过、最需要提示的词（放在最前面，Whisper 会优先参考）——
+intensive variable = 强度变量
+extensive variable = 广延变量
+state of the system = 系统的状态
+pseudo one-component = 拟单组分
+underbar = 下划线（表示摩尔量）
+degrees of freedom = 自由度
+ideal gas law = 理想气体状态方程
+piston-cylinder assembly = 活塞-气缸装置
+diathermal cylinder = 导热气缸
+insulated cylinder = 绝热气缸
+monatomic gas = 单原子气体
+shaft work = 轴功
+stirrer = 搅拌器
+evacuated = 抽真空的
+negative sign = 负号
+P_ext = 外压 P_ext
+throttling device = 节流装置
+saturated steam tables = 饱和水蒸气表
+Problem 2.47 (homework problem numbers are read aloud like "two forty-seven")
+Koretsky
+# —— 其他术语 ——
 thermodynamics = 热力学
 system = 系统
 surroundings = 环境
@@ -24,22 +46,15 @@ enthalpy = 焓
 entropy = 熵
 heat = 热
 work = 功
-shaft work = 轴功
 flow work = 流动功
 boundary work = 边界功（体积功）
 external pressure = 外压
-P_ext = 外压 P_ext
 piston = 活塞
 cylinder = 气缸
-stirrer = 搅拌器
-evacuated = 抽真空的
 insulated = 保温的；绝热的
-insulated cylinder = 绝热气缸
 diathermal = 导热的
-diathermal cylinder = 导热气缸
 diathermic = 导热的
 pin = 销钉
-negative sign = 负号
 sign convention = 符号约定
 work done by the gas = 气体对外做的功
 work done on the gas = 外界对气体做的功
@@ -58,7 +73,6 @@ energy balance = 能量衡算
 kinetic energy = 动能
 potential energy = 势能
 ideal gas = 理想气体
-monatomic gas = 单原子气体
 diatomic gas = 双原子气体
 heat capacity = 热容
 C_v = 定容热容 C_v
@@ -124,9 +138,7 @@ UNIFAC = UNIFAC
 chemical reaction equilibrium = 化学反应平衡
 equilibrium constant = 平衡常数
 extent of reaction = 反应进度
-Koretsky
 # —— 以下根据课堂笔记和转录补充 ——
-throttling device = 节流装置
 throttling = 节流
 isenthalpic = 等焓
 steam table = 水蒸气表

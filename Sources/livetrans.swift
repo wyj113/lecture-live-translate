@@ -1409,10 +1409,20 @@ func collapseRepeats(_ text: String) -> String {
 
 /// Short context for Whisper: the course and its terms help it spell technical words.
 /// (Not the previous sentence: on unclear audio Whisper tends to repeat its prompt.)
+/// Whisper only sees ~224 prompt tokens and keeps the *end* when it's longer, and the end
+/// also weighs most. So take the glossary's leading (most important) terms that fit, and
+/// list them in reverse so the most important come last.
 func whisperPrompt(topic: String, terms: [String]) -> String {
-    var prompt = "A university lecture on \(topic)."
-    if !terms.isEmpty { prompt += " Terms: " + terms.joined(separator: ", ") }
-    return String(prompt.prefix(600)) + "."
+    var seen = Set<String>()
+    var picked: [String] = []
+    var length = 0
+    for term in terms where seen.insert(term.lowercased()).inserted {
+        guard length + term.count + 2 <= 700 else { break }
+        picked.append(term)
+        length += term.count + 2
+    }
+    let intro = "A university lecture on \(topic)."
+    return picked.isEmpty ? intro : intro + " Terms: " + picked.reversed().joined(separator: ", ") + "."
 }
 
 /// A whisper.cpp model on the GPU. Calls are serialized on one queue.
@@ -1850,8 +1860,10 @@ struct LiveTrans {
             let whisper = try Whisper(modelPath: whisperModel, language: String(o.from.prefix(2)))
             _ = await whisper.transcribe([Float](repeating: 0, count: 16000), prompt: "", quick: true)  // warm up the GPU
             await console.setStatus("")
+            let prompt = whisperPrompt(topic: o.topic, terms: vocab.terms)
+            debug("whisper prompt (\(prompt.count) chars): \(prompt)")
             recognizer = WhisperRecognizer(whisper: whisper, vad: try VoiceDetector(modelPath: vadModel),
-                                           prompt: whisperPrompt(topic: o.topic, terms: vocab.terms), live: live)
+                                           prompt: prompt, live: live)
         } else {
             await ensureSpeechAuthorization()
             let engine = try await chooseEngine(o.from, live: live, console: console)
