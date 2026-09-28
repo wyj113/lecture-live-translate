@@ -1395,7 +1395,20 @@ func cleanWhisperText(_ raw: String) -> String {
     return stock.contains(text.lowercased()) ? "" : text
 }
 
+/// Whisper can loop on unclear audio ("How much work? How much work? How much work?").
+/// Keep one of each run of identical sentences.
+func collapseRepeats(_ text: String) -> String {
+    let sentences = text.replacingOccurrences(of: #"(?<=[.?!])\s+"#, with: "\n", options: .regularExpression)
+        .split(separator: "\n").map(String.init)
+    var kept: [String] = []
+    for sentence in sentences where sentence.lowercased() != kept.last?.lowercased() {
+        kept.append(sentence)
+    }
+    return kept.joined(separator: " ")
+}
+
 /// Short context for Whisper: the course and its terms help it spell technical words.
+/// (Not the previous sentence: on unclear audio Whisper tends to repeat its prompt.)
 func whisperPrompt(topic: String, terms: [String]) -> String {
     var prompt = "A university lecture on \(topic)."
     if !terms.isEmpty { prompt += " Terms: " + terms.joined(separator: ", ") }
@@ -1500,7 +1513,7 @@ final class Utterances {
 
     private static let frame = VoiceDetector.frame
     private static let prerollFrames = 10     // ~0.3 s kept from before speech starts
-    private static let endSilenceFrames = 19  // ~0.6 s
+    private static let endSilenceFrames = 25  // ~0.8 s: lecturers pause mid-sentence for emphasis
     private static let keptSilenceFrames = 6  // ~0.2 s left on the end
     private static let maxSamples = 12 * 16000
 
@@ -1605,7 +1618,7 @@ final class WhisperRecognizer: @unchecked Sendable {  // `utterances` is only to
     private let queue = DispatchQueue(label: "livetrans.vad")  // owns `utterances`
     private var utterances: Utterances!
     private var partialTask: Task<Void, Never>?
-    private var lastFinal = ""
+    private var lastFinal = ""  // to drop an exact repeat
     private var finished = false
 
     init(whisper: Whisper, vad: VoiceDetector, prompt: String, live: Bool) {
@@ -1617,19 +1630,15 @@ final class WhisperRecognizer: @unchecked Sendable {  // `utterances` is only to
         utterances = Utterances(vad: vad) { chunkSink.yield($0) }
         Task {
             for await chunk in chunks {
-                let text = await whisper.transcribe(chunk.samples, prompt: self.prompt, quick: false)
+                let text = collapseRepeats(await whisper.transcribe(chunk.samples, prompt: self.basePrompt, quick: false))
                 debug("whisper final [\(seconds(chunk.start))–\(seconds(chunk.end))] \(text)")
-                guard !text.isEmpty else { continue }
+                guard !text.isEmpty, text.lowercased() != self.lastFinal.lowercased() else { continue }
                 self.lastFinal = text
                 self.sink.yield(Piece(text: text, start: chunk.start, end: chunk.end, isFinal: true))
             }
             self.sink.finish()
         }
         if live { partialTask = Task { await self.runPartials() } }
-    }
-
-    private var prompt: String {
-        lastFinal.isEmpty ? basePrompt : basePrompt + " " + String(lastFinal.suffix(200))
     }
 
     func feed(_ samples: [Float]) {
@@ -1661,7 +1670,7 @@ final class WhisperRecognizer: @unchecked Sendable {  // `utterances` is only to
             else { continue }
             lastID = now.id
             lastCount = now.samples.count
-            let text = await whisper.transcribe(now.samples, prompt: prompt, quick: true)
+            let text = collapseRepeats(await whisper.transcribe(now.samples, prompt: basePrompt, quick: true))
             guard !text.isEmpty, queue.sync(execute: { utterances.isCurrent(now.id) }) else { continue }
             sink.yield(Piece(text: text, start: now.start,
                              end: now.start + Double(now.samples.count) / 16000, isFinal: false))
