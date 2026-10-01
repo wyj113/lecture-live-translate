@@ -13,3 +13,6 @@
 
 .DS_Store
 .claude/
+
+# private glossaries (unpublished research)
+/vocab/research.txt

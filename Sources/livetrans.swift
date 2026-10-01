@@ -1224,7 +1224,13 @@ func runPipeline(pieces: AsyncThrowingStream<Piece, Error>, translation: Transla
             lastStart = Date()
             debug("preview request (\(text.count) chars)")
             do {
-                try await previewer.preview(text) { await console.setPreview($0, complete: $1) }
+                var firstText: Date?
+                try await previewer.preview(text) { translation, complete in
+                    if firstText == nil, !translation.isEmpty { firstText = Date() }
+                    await console.setPreview(translation, complete: complete)
+                }
+                debug(String(format: "preview done: first text %.2fs, complete %.2fs",
+                             firstText.map { $0.timeIntervalSince(lastStart) } ?? -1, Date().timeIntervalSince(lastStart)))
             } catch {
                 if Task.isCancelled { return }
                 if previewer.disabled {
