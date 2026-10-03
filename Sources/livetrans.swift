@@ -1,4 +1,6 @@
+import AudioToolbox
 import AVFoundation
+import CoreAudio
 import CoreMedia
 import Foundation
 import Speech
@@ -32,6 +34,7 @@ let usage = """
   --check                      检查识别模型、翻译语言包、麦克风权限、API key
   --engine <whisper|apple>     语音识别引擎（默认 whisper，没装模型时用系统听写）
   --whisper-model <文件>        指定 Whisper 模型文件（默认 models/ 里的 large-v3-turbo）
+  --mic <名字>                  用哪个麦克风，写设备名的一部分就行，比如 --mic iphone（默认用系统当前的输入）
 
 设置了环境变量 ANTHROPIC_API_KEY 时用 Claude 边听边翻，每句定稿后再纠错精翻；
 没设置就用本地翻译，只翻译定稿的句子。
@@ -56,6 +59,7 @@ struct Options {
     var translate = true
     var check = false
     var engine = "auto"
+    var mic: String?
     var whisperModel: String?
 }
 
@@ -89,6 +93,7 @@ func parseOptions() throws -> Options {
         case "--no-translate": o.translate = false
         case "--check": o.check = true
         case "--engine": o.engine = try value(for: arg)
+        case "--mic": o.mic = try value(for: arg)
         case "--whisper-model": o.whisperModel = try value(for: arg)
         case "-h", "--help": print(usage); exit(0)
         default:
@@ -1336,6 +1341,57 @@ func onInterrupt(_ handler: @escaping () -> Void) {
 
 // MARK: - Audio input
 
+struct InputDevice {
+    let id: AudioDeviceID
+    let name: String
+    let isDefault: Bool
+}
+
+/// Device names for display, each once, with the current default marked.
+func uniqueNames(_ devices: [InputDevice]) -> [String] {
+    var seen = Set<String>()
+    let defaultName = devices.first(where: \.isDefault)?.name
+    return devices.compactMap { device in
+        guard seen.insert(device.name).inserted else { return nil }
+        return device.name == defaultName ? "\(device.name)（当前默认）" : device.name
+    }
+}
+
+/// Every device with input channels (built-in mic, iPhone via Continuity, USB / wireless mics …).
+func inputDevices() -> [InputDevice] {
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(system, &address, 0, nil, &size, &ids) == noErr else { return [] }
+
+    var defaultAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                                                    mScope: kAudioObjectPropertyScopeGlobal,
+                                                    mElement: kAudioObjectPropertyElementMain)
+    var defaultID = AudioDeviceID(0)
+    var defaultSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+    AudioObjectGetPropertyData(system, &defaultAddress, 0, nil, &defaultSize, &defaultID)
+
+    return ids.compactMap { id in
+        var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                                                 mScope: kAudioObjectPropertyScopeInput,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var streamSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &streamSize) == noErr, streamSize > 0 else { return nil }
+        var nameAddress = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                                     mScope: kAudioObjectPropertyScopeGlobal,
+                                                     mElement: kAudioObjectPropertyElementMain)
+        var name: Unmanaged<CFString>?
+        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &nameAddress, 0, nil, &nameSize, &name) == noErr,
+              let name = name?.takeRetainedValue() else { return nil }
+        return InputDevice(id: id, name: name as String, isDefault: id == defaultID)
+    }
+}
+
 /// The microphone, or (for testing) LIVETRANS_SIMULATE_MIC=<audio file> played through
 /// the same live path in real time, so it can be exercised without making a sound.
 final class AudioInput {
@@ -1343,10 +1399,32 @@ final class AudioInput {
     private let simulated: AVAudioFile?
     private var stopped = false
     let format: AVAudioFormat
+    let deviceName: String
 
-    init() throws {
+    /// `mic`: part of an input device's name (e.g. "iphone"); nil uses the system's current input.
+    init(mic: String? = nil) throws {
         simulated = try ProcessInfo.processInfo.environment["LIVETRANS_SIMULATE_MIC"]
             .map { try AVAudioFile(forReading: URL(fileURLWithPath: $0)) }
+        if let simulated {
+            deviceName = "模拟输入 " + simulated.url.lastPathComponent
+        } else if let mic {
+            let devices = inputDevices()
+            // The same device can be listed twice (e.g. an iPhone over two transports); prefer the active one.
+            let matches = devices.filter { $0.name.localizedCaseInsensitiveContains(mic) }
+            guard let device = matches.first(where: \.isDefault) ?? matches.first else {
+                let names = uniqueNames(devices).joined(separator: "、")
+                throw CLIError("找不到名字里含 \"\(mic)\" 的麦克风。现在能用的有：\(names)")
+            }
+            // Must happen before reading the input format, which depends on the device.
+            guard let unit = engine.inputNode.audioUnit else { throw CLIError("无法切换麦克风") }
+            var id = device.id
+            let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global,
+                                              0, &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard status == noErr else { throw CLIError("切换到 \(device.name) 失败（\(status)）") }
+            deviceName = device.name
+        } else {
+            deviceName = inputDevices().first(where: { $0.isDefault })?.name ?? "系统默认输入"
+        }
         format = simulated?.processingFormat ?? engine.inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw CLIError("没有找到可用的麦克风") }
     }
@@ -1702,9 +1780,10 @@ final class WhisperRecognizer: @unchecked Sendable {  // `utterances` is only to
     }
 }
 
-func runWhisperMic(recognizer: WhisperRecognizer, translation: Translation?,
+func runWhisperMic(recognizer: WhisperRecognizer, mic: String?, translation: Translation?,
                    writer: TranscriptWriter, console: Console) async throws {
-    let input = try AudioInput()
+    let input = try AudioInput(mic: mic)
+    await console.emit("麦克风：\(input.deviceName)")
     guard let converter = AVAudioConverter(from: input.format, to: whisperFormat) else {
         throw CLIError("无法匹配麦克风音频格式")
     }
@@ -1748,9 +1827,10 @@ func runWhisperFile(_ path: String, recognizer: WhisperRecognizer, translation: 
 
 // MARK: - Apple speech (fallback)
 
-func runAppleMic(analyzer: SpeechAnalyzer, engine: Engine, translation: Translation?,
+func runAppleMic(analyzer: SpeechAnalyzer, engine: Engine, mic: String?, translation: Translation?,
                  writer: TranscriptWriter, console: Console) async throws {
-    let input = try AudioInput()
+    let input = try AudioInput(mic: mic)
+    await console.emit("麦克风：\(input.deviceName)")
     guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [engine.module],
                                                                              considering: input.format),
           let converter = AVAudioConverter(from: input.format, to: analyzerFormat)
@@ -1850,6 +1930,8 @@ struct LiveTrans {
         default: mic = "被拒绝 —— 去 系统设置 → 隐私与安全性 → 麦克风 打开"
         }
         print("麦克风权限：", mic)
+        let devices = inputDevices()
+        print("可用的麦克风：", devices.isEmpty ? "没找到" : uniqueNames(devices).joined(separator: "、"))
     }
 
     static func run(_ options: Options) async throws {
@@ -1903,12 +1985,12 @@ struct LiveTrans {
         case let (recognizer?, _, path?):
             try await runWhisperFile(path, recognizer: recognizer, translation: translation, writer: writer, console: console)
         case let (recognizer?, _, nil):
-            try await runWhisperMic(recognizer: recognizer, translation: translation, writer: writer, console: console)
+            try await runWhisperMic(recognizer: recognizer, mic: o.mic, translation: translation, writer: writer, console: console)
         case let (nil, apple?, path?):
             try await runAppleFile(path, analyzer: apple.analyzer, engine: apple.engine, translation: translation,
                                    writer: writer, console: console)
         case let (nil, apple?, nil):
-            try await runAppleMic(analyzer: apple.analyzer, engine: apple.engine, translation: translation,
+            try await runAppleMic(analyzer: apple.analyzer, engine: apple.engine, mic: o.mic, translation: translation,
                                   writer: writer, console: console)
         default:
             throw CLIError("没有可用的识别引擎")

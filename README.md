@@ -114,6 +114,7 @@ Koretsky
 - `--provider <claude|deepseek|openai>`、`--model <名字>`：换 AI 服务和模型（见上文）。
 - `--no-preview`：不边听边翻，只翻译定稿的句子。
 - `--no-ai`：完全不用 API，只用本地翻译（效果差）。
+- `--mic <名字>`：指定麦克风，写设备名的一部分就行，比如 `--mic iphone`（用 iPhone 当麦克风）或 `--mic dji`（无线麦）。不写就用系统当前的输入；`livetrans --check` 会列出所有可用的麦克风，启动时也会显示正在用哪个。
 - `--to zh-Hant`：翻成繁体中文。
 - `--engine apple`：改用 macOS 自带的听写识别。准确率差很多，只用来应急。
 
