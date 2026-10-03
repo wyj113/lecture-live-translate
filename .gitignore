@@ -14,5 +14,6 @@
 .DS_Store
 .claude/
 
-# private glossaries (unpublished research)
-/vocab/research.txt
+# glossaries are personal (course / research specific); only the example is shared
+/vocab/*
+!/vocab/example.txt

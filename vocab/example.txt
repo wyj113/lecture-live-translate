@@ -1,0 +1,15 @@
+# topic: general chemistry (replace with your course)
+# 示例术语表。复制一份改名为 vocab/<课程名>.txt，用 --vocab <课程名> 加载。
+# 第一行 "# topic:" 写课程主题，告诉 Whisper 和 AI 这是什么课。
+# 之后一行一个术语，可以写成 "英文 = 中文"：英文部分提示 Whisper 怎么拼写，整行交给 AI 统一译名。
+# Whisper 只参考最前面的几十个词：课上听错过的词、少见的专有名词放在最前面。
+# —— 最需要提示的词 ——
+Avogadro's number = 阿伏伽德罗常数
+Le Chatelier's principle = 勒夏特列原理
+stoichiometry = 化学计量学
+# —— 其他术语 ——
+equilibrium constant = 平衡常数
+activation energy = 活化能
+enthalpy = 焓
+entropy = 熵
+mole fraction = 摩尔分数

@@ -6,7 +6,7 @@ It was built for following English-taught university courses. Per-course glossar
 
 - Requirements: Apple Silicon Mac, macOS 26+, Xcode Command Line Tools, Homebrew, and your own API key for translation: Claude, DeepSeek, or any OpenAI-compatible endpoint
 - Setup: `./setup.sh` installs whisper.cpp, downloads the models (~575 MB) and builds `./livetrans`
-- Run: `export ANTHROPIC_API_KEY=...` then `./livetrans --vocab polymer`
+- Run: `export ANTHROPIC_API_KEY=...` then `./livetrans --vocab example` (make your own glossary from `vocab/example.txt`)
 
 ---
 
@@ -93,6 +93,7 @@ livetrans --help                       # 全部选项
 
 ## 术语表（每门课一份）
 
+术语表是你自己的，按课程来建，不在仓库里同步；仓库里只有一个示例 `vocab/example.txt`。
 `vocab/` 里每门课一个文件，`--vocab 名字` 就会用 `vocab/名字.txt`：
 
 ```
@@ -107,7 +108,7 @@ Koretsky
 - 之后一行一个术语，可以写成 `英文 = 中文`。英文部分会提示 Whisper 怎么拼写，整行交给 Claude 统一译名。
 - 课上发现哪个词总被听错，就把正确的词加到**文件最前面**。Whisper 能参考的长度有限（大约前几十个词），排在前面的词会优先提示给它；Claude / DeepSeek 则会看到整个术语表。
 
-自带两个例子：`polymer`（高分子化学）和 `thermo`（化工热力学）。新增一门课：照格式另建一个 `vocab/课程名.txt` 就行。
+新增一门课：复制 `vocab/example.txt`，改名为 `vocab/课程名.txt`，再照格式填写。前面用法里的 `polymer`、`thermo` 就是这样自建的术语表名字。
 
 ## 其他选项
 
